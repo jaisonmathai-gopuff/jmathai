@@ -1,0 +1,950 @@
+"""
+batch_ss_monte_carlo.py
+=======================
+Batch Safety Stock Monte Carlo — generalises the single-SKU JJA simulation
+across multiple product × location intersections pulled live from Snowflake.
+
+Quintile-aware OOS tolerance
+-----------------------------
+  Q1  — max 1 OOS day acceptable (highest priority)
+  Q2  — max 1 OOS day acceptable
+  Q3  — max 3 OOS days acceptable
+  Q4  — max 4 OOS days acceptable
+  Q5  — max 4 OOS days acceptable
+  NULL— treated as Q3 (max 3 OOS days)
+
+The recommended SS is the minimum number of coverage days where at least
+TARGET_SL (default 95%) of simulation paths have ≤ oos_tolerance OOS days.
+
+Architecture
+------------
+  DataFetcher      — pulls demand, fill rates, delivery cadence, case size,
+                     current Kinaxis SS policy, and quintile flags per pair
+  SimulationEngine — DOW-aware (s,S) Monte Carlo (vectorised, numpy)
+  BatchRunner      — orchestrates the loop, handles errors, writes output
+
+Inputs
+------
+  candidates.csv   — two columns: product_id, location_id
+                     (or pass --auto-candidates to pull all-quintile pairs
+                      from the specified sites directly)
+
+Outputs
+-------
+  results/ss_batch_YYYYMMDD_HHMMSS.csv
+  results/ss_batch_YYYYMMDD_HHMMSS.xlsx  (Summary + Full Sweep tabs)
+
+Usage
+-----
+  # Auto-pull all quintile candidates for specified sites:
+  python batch_ss_monte_carlo.py \\
+    --user you@gopuff.com \\
+    --auto-candidates \\
+    --location-ids 258,37,690,265,99
+
+  # From a candidates CSV file:
+  python batch_ss_monte_carlo.py \\
+    --user you@gopuff.com \\
+    --candidates candidates.csv
+
+  # Tune simulation parameters:
+  python batch_ss_monte_carlo.py \\
+    --user you@gopuff.com \\
+    --auto-candidates \\
+    --lookback-days 120 \\
+    --n-sims 5000 \\
+    --target-sl 0.95 \\
+    --ss-min 3 \\
+    --ss-max 21
+
+Dependencies
+------------
+  pip install snowflake-connector-python[pandas] numpy pandas openpyxl
+"""
+
+import argparse
+import datetime
+import math
+import os
+import sys
+import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import snowflake.connector
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+SNOWFLAKE_ACCOUNT  = "gopuff.east-us-2.azure"
+SNOWFLAKE_DATABASE = "MCP_MARTS"
+SNOWFLAKE_SCHEMA   = "GOLD"
+SNOWFLAKE_ROLE     = "MCP_SERVICE_ROLE"
+SNOWFLAKE_WH       = "MCP_SERVICE_WH"
+
+# Simulation defaults (all overridable via CLI)
+DEFAULT_LOOKBACK_DAYS = 90      # demand history window
+DEFAULT_N_SIMS        = 2000    # paths per intersection (use 5000 for final runs)
+DEFAULT_TARGET_SL     = 0.95    # fraction of paths that must meet OOS tolerance
+DEFAULT_SS_MIN        = 3       # minimum SS days to scan
+DEFAULT_SS_MAX        = 21      # maximum SS days to scan
+DEFAULT_MAX_WORKERS   = 4       # parallel Snowflake fetch threads
+
+# OOS tolerance by CX quintile — max acceptable OOS days in the simulation window.
+# Recommendation = min SS where (paths with OOS ≤ tolerance) / total paths >= TARGET_SL.
+# NULL quintile is treated as Q3.
+QUINTILE_OOS_TOLERANCE: Dict[Optional[int], int] = {
+    1: 1,
+    2: 1,
+    3: 3,
+    4: 4,
+    5: 4,
+    None: 3,
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA CLASSES
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class IntersectionData:
+    """All inputs required to run one Monte Carlo."""
+    product_id:       int
+    location_id:      int
+    product_name:     str            = ""
+    location_name:    str            = ""
+    case_size:        int            = 1
+    delivery_dows:    set            = field(default_factory=lambda: {2, 5})  # Tue, Fri
+    daily_demand:     Dict           = field(default_factory=dict)  # date_str → units
+    fill_rates:       List[float]    = field(default_factory=list)
+    cx_quintile:      Optional[int]  = None
+    profit_cubic_q:   Optional[int]  = None
+    sc_quintile:      Optional[int]  = None
+    oos_tolerance:    int            = 3   # max acceptable OOS days (from quintile)
+    kinaxis_policy:   str            = "unknown"
+    kinaxis_ss_days:  int            = 0
+    l13w_revenue:     float          = 0.0
+    oos_pct:          float          = 0.0
+    error:            str            = ""
+
+
+@dataclass
+class SimResult:
+    """Output from one product × location simulation sweep."""
+    product_id:           int
+    location_id:          int
+    product_name:         str
+    location_name:        str
+    case_size:            int
+    delivery_dows:        str
+    cx_quintile:          Optional[int]
+    profit_cubic_q:       Optional[int]
+    sc_quintile:          Optional[int]
+    oos_tolerance:        int
+    target_sl_pct:        float          # target SL % used for this intersection
+    kinaxis_policy:       str
+    kinaxis_ss_days:      int
+    l13w_revenue:         float
+    oos_pct:              float
+    demand_mean:          float
+    demand_std:           float
+    fill_rate_mean:       float
+    fill_rate_std:        float
+    n_demand_days:        int
+    n_deliveries:         int
+    recommended_ss_days:  int            # min SS to hit target SL at oos_tolerance
+    recommended_sl:       float          # achieved SL at recommended SS
+    current_sl:           float          # SL at current Kinaxis policy level
+    delta_ss_days:        int            # recommended − current
+    recommended_avg_stgt: float
+    recommended_cases:    int
+    current_avg_stgt:     float
+    current_cases:        int
+    full_sweep:           Dict           # {ss_days: {sl0, sl1, sl_tol, avg_stgt, cases}}
+    error:                str            = ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SNOWFLAKE CONNECTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_connection(user: str, password: Optional[str] = None) -> snowflake.connector.SnowflakeConnection:
+    """
+    Open a Snowflake connection.
+    If password is None, falls back to browser-based SSO (Okta).
+    For non-interactive / CI use, set SNOWFLAKE_PRIVATE_KEY_PATH env var.
+    """
+    private_key_path = os.environ.get("SNOWFLAKE_PRIVATE_KEY_PATH")
+
+    kwargs = dict(
+        account   = SNOWFLAKE_ACCOUNT,
+        user      = user,
+        role      = SNOWFLAKE_ROLE,
+        warehouse = SNOWFLAKE_WH,
+        database  = SNOWFLAKE_DATABASE,
+        schema    = SNOWFLAKE_SCHEMA,
+    )
+
+    if private_key_path:
+        from cryptography.hazmat.primitives.serialization import (
+            load_pem_private_key, Encoding, PrivateFormat, NoEncryption
+        )
+        from cryptography.hazmat.backends import default_backend
+        passphrase = os.environ.get("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE", "").encode() or None
+        with open(private_key_path, "rb") as f:
+            private_key = load_pem_private_key(f.read(), password=passphrase,
+                                               backend=default_backend())
+        kwargs["private_key"] = private_key.private_bytes(
+            Encoding.DER, PrivateFormat.PKCS8, NoEncryption()
+        )
+    elif password:
+        kwargs["password"] = password
+    else:
+        kwargs["authenticator"] = "externalbrowser"  # SSO / Okta pop-up
+
+    return snowflake.connector.connect(**kwargs)
+
+
+def query_df(conn: snowflake.connector.SnowflakeConnection,
+             sql: str, params=None) -> pd.DataFrame:
+    cur = conn.cursor()
+    cur.execute(sql, params or {})
+    cols = [c[0].lower() for c in cur.description]
+    rows = cur.fetchall()
+    cur.close()
+    return pd.DataFrame(rows, columns=cols)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA FETCHER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DataFetcher:
+    def __init__(self, conn: snowflake.connector.SnowflakeConnection,
+                 lookback_days: int = 90):
+        self.conn         = conn
+        self.lookback_days = lookback_days
+        self.end_date     = datetime.date.today() - datetime.timedelta(days=1)
+        self.start_date   = self.end_date - datetime.timedelta(days=lookback_days - 1)
+
+    # ── Candidates ────────────────────────────────────────────────────────────
+
+    def get_auto_candidates(self, location_ids: List[int]) -> pd.DataFrame:
+        """
+        Pull ALL active product-location pairs for the specified sites across
+        every CX quintile (Q1–Q5 and NULL). OOS tolerance is assigned
+        downstream based on CX_QUINTILE_LOCATION:
+          Q1/Q2 → 1 day, Q3/NULL → 3 days, Q4/Q5 → 4 days.
+        """
+        loc_list = ", ".join(str(x) for x in location_ids)
+        sql = f"""
+            SELECT
+                f.PRODUCT_ID::INT           AS product_id,
+                f.LOCATION_ID::INT          AS location_id,
+                COALESCE(q.PRODUCT_NAME, f.PRODUCT_ID::STRING) AS product_name,
+                l.LOCATION_NAME,
+                f.CX_QUINTILE_LOCATION,
+                f.PROFIT_CUBIC_QUINTILE_PROD_LOCATION,
+                f.SC_LOCATION_QUINTILE,
+                ROUND(q.L13W_REVENUE_PRODUCT_SITE, 2)   AS l13w_revenue,
+                ROUND(q.L13W_OOS_PCT * 100, 1)          AS oos_pct,
+                f.VENDOR_NAME,
+                f.DC_SOURCED_INTERSECTION
+            FROM MCP_MARTS.GOLD.DBT_BUFFET_DIM_MSC_PRODUCT_LOCATION_FLAGS f
+            JOIN MCP_MARTS.GOLD.DBT_LOCATIONS l
+                ON f.LOCATION_ID::INT = l.ID
+            JOIN MCP_MARTS.GOLD.DBT_PRODUCTS p
+                ON f.PRODUCT_ID::INT = p.ID
+            JOIN MCP_MARTS.GOLD.DBT_CURRENT_INVENTORY ci
+                ON f.PRODUCT_ID::INT  = ci.PRODUCT_ID
+               AND f.LOCATION_ID::INT = ci.LOCATION_ID
+            LEFT JOIN MCP_MARTS.GOLD.DBT_BUFFET_SUPPLY_CHAIN_PRODUCT_LOCATION_QUINTILES q
+                ON f.PRODUCT_ID::INT  = q.PRODUCT_ID
+               AND f.LOCATION_ID::INT = q.LOCATION_ID
+            WHERE f.LOCATION_ID::INT IN ({loc_list})
+              AND ci.IS_ACTIVE_ASSORTMENT = TRUE
+            ORDER BY f.LOCATION_ID::INT,
+                     f.CX_QUINTILE_LOCATION ASC NULLS LAST,
+                     q.L13W_REVENUE_PRODUCT_SITE DESC NULLS LAST
+        """
+        return query_df(self.conn, sql)
+
+    # ── Demand ────────────────────────────────────────────────────────────────
+
+    def get_daily_demand(self, product_id: int, location_id: int) -> Dict[str, float]:
+        """Returns daily units sold keyed by ISO date string."""
+        sql = """
+            SELECT
+                o.CREATED_AT_FINANCIAL::DATE  AS sale_date,
+                SUM(oi.QUANTITY)              AS units_sold
+            FROM MCP_MARTS.GOLD.DBT_ORDER_ITEMS_LITE oi
+            JOIN MCP_MARTS.GOLD.DBT_ORDERS_LITE o ON oi.ORDER_ID = o.ID
+            WHERE o.ORDER_COMPLETED = 1
+              AND o.COMPANY         = 'Gopuff'
+              AND oi.PRODUCT_ID     = %(pid)s
+              AND o.LOCATION_ID     = %(lid)s
+              AND o.CREATED_AT_FINANCIAL::DATE BETWEEN %(start)s AND %(end)s
+            GROUP BY 1
+            ORDER BY 1
+        """
+        df = query_df(self.conn, sql, {
+            "pid": product_id, "lid": location_id,
+            "start": self.start_date.isoformat(), "end": self.end_date.isoformat(),
+        })
+        if df.empty:
+            return {}
+        return {str(row.sale_date): float(row.units_sold) for _, row in df.iterrows()}
+
+    # ── Fill Rates ────────────────────────────────────────────────────────────
+
+    def get_fill_rates(self, product_id: int, location_id: int) -> List[float]:
+        """
+        Returns empirical fill rates (qty_received / qty_ordered) from
+        MELTANO.SC_NOS purchase order lines (3 years of history).
+        Capped at 1.0; no-shows are 0.0.
+
+        NOTE: Verify QUANTITY_ORDERED / QUANTITY_RECEIVED column names against
+              your PURCHASE_ORDER_LINE schema before running at scale.
+              Run: SELECT * FROM MELTANO.SC_NOS.PURCHASE_ORDER_LINE LIMIT 1
+        """
+        three_yr_ago = (datetime.date.today() - datetime.timedelta(days=3 * 365)).isoformat()
+        sql = """
+            SELECT
+                pol.QUANTITY,
+                pol.EACHES_QUANTITY
+            FROM MELTANO.SC_NOS.PURCHASE_ORDER_LINE  pol
+            JOIN MELTANO.SC_NOS.PURCHASE_ORDER        po
+                ON pol.PURCHASE_ORDER_ID = po.ID
+            JOIN MELTANO.SC_NOS.PURCHASE_SAGA         ps
+                ON po.PURCHASE_SAGA_ID = ps.ID
+            WHERE pol.UNIT_ID              = %(pid)s
+              AND ps.DESTINATION_LOCATION_ID  = %(lid)s
+              AND pol.QUANTITY        > 0
+              AND po.DB_CREATED_AT           >= %(start)s
+        """
+        df = query_df(self.conn, sql, {
+            "pid": product_id, "lid": location_id, "start": three_yr_ago,
+        })
+        if df.empty:
+            return []
+        rates = (
+            df["eaches_quantity"].fillna(0) / df["quantity"]
+        ).clip(0.0, 1.0).tolist()
+        return [float(r) for r in rates]
+
+    # ── Delivery Cadence ──────────────────────────────────────────────────────
+
+    def get_delivery_cadence(self, product_id: int, location_id: int) -> set:
+        """
+        Infers delivery days-of-week from PO arrival history (last 90 days).
+        Returns a set of ISO weekday integers (1=Mon … 7=Sun).
+        Falls back to {2, 5} (Tue/Fri) if fewer than 5 arrivals found.
+        """
+        sql = """
+            SELECT
+                DAYOFWEEKISO(ps.ARRIVAL_TIMESTAMP)  AS dow,
+                COUNT(*)                            AS arrivals
+            FROM MELTANO.SC_NOS.PURCHASE_SHIPMENT  ps
+            JOIN MELTANO.SC_NOS.PURCHASE_SAGA      sg
+                ON ps.PURCHASE_SAGA_ID = sg.ID
+            WHERE sg.DESTINATION_LOCATION_ID = %(lid)s
+              AND ps.ARRIVAL_TIMESTAMP >= DATEADD('day', -90, CURRENT_DATE)
+              AND ps.ARRIVAL_TIMESTAMP IS NOT NULL
+            GROUP BY 1
+            HAVING COUNT(*) >= 3
+            ORDER BY 2 DESC
+        """
+        df = query_df(self.conn, sql, {"lid": location_id})
+        if df.empty or df["arrivals"].sum() < 5:
+            return {2, 5}
+        return set(df.nlargest(2, "arrivals")["dow"].astype(int).tolist())
+
+    # ── Case Size ─────────────────────────────────────────────────────────────
+
+    def get_case_size(self, product_id: int) -> int:
+        """
+        Returns the case pack size for a product. Falls back to 1.
+        NOTE: Adjust column name if DBT_PRODUCTS uses UNITS_PER_CASE or PACK_SIZE.
+        """
+        sql = """
+            SELECT 1 AS case_size
+            FROM MCP_MARTS.GOLD.DBT_PRODUCTS
+            WHERE ID = %(pid)s
+            LIMIT 1
+        """
+        try:
+            df = query_df(self.conn, sql, {"pid": product_id})
+            if not df.empty and df["case_size"].iloc[0]:
+                return max(1, int(df["case_size"].iloc[0]))
+        except Exception:
+            pass
+        return 1
+
+    # ── Current Kinaxis SS Policy ─────────────────────────────────────────────
+
+    def get_kinaxis_policy(self, product_id: int, location_id: int) -> Tuple[str, int]:
+        """Returns (policy_name, ss_days) from the Kinaxis SS table."""
+        sql = """
+            SELECT SAFETY_STOCK_POLICY, SAFETY_STOCK_DAYS
+            FROM MCP_MARTS.GOLD.DBT_BUFFET_KINAXIS_RECENT_SAFETYSTOCK_POLICIES
+            WHERE PRODUCT_ID::INT  = %(pid)s
+              AND LOCATION_ID::INT = %(lid)s
+            ORDER BY RECENT_GENERATION_DATE DESC
+            LIMIT 1
+        """
+        df = query_df(self.conn, sql, {"pid": product_id, "lid": location_id})
+        if df.empty:
+            return "not_in_kinaxis", 0
+        row = df.iloc[0]
+        return str(row["safety_stock_policy"]), int(row["safety_stock_days"] or 0)
+
+    # ── Full intersection fetch ───────────────────────────────────────────────
+
+    def fetch(self, product_id: int, location_id: int,
+              product_name: str = "", location_name: str = "",
+              cx_q=None, profit_q=None, sc_q=None,
+              l13w_revenue: float = 0.0, oos_pct: float = 0.0) -> IntersectionData:
+        """Fetch all data for one product × location pair."""
+        oos_tolerance = QUINTILE_OOS_TOLERANCE.get(cx_q, QUINTILE_OOS_TOLERANCE[None])
+
+        d = IntersectionData(
+            product_id    = product_id,
+            location_id   = location_id,
+            product_name  = product_name,
+            location_name = location_name,
+            cx_quintile   = cx_q,
+            profit_cubic_q = profit_q,
+            sc_quintile   = sc_q,
+            oos_tolerance = oos_tolerance,
+            l13w_revenue  = l13w_revenue,
+            oos_pct       = oos_pct,
+        )
+        try:
+            d.daily_demand              = self.get_daily_demand(product_id, location_id)
+            d.fill_rates                = self.get_fill_rates(product_id, location_id)
+            d.delivery_dows             = self.get_delivery_cadence(product_id, location_id)
+            d.case_size                 = self.get_case_size(product_id)
+            d.kinaxis_policy, d.kinaxis_ss_days = self.get_kinaxis_policy(
+                product_id, location_id
+            )
+        except Exception as e:
+            d.error = str(e)
+        return d
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIMULATION ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SimulationEngine:
+    """
+    DOW-aware (s,S) Monte Carlo safety stock simulator.
+
+    Key design:
+    ─ Demand   : stochastic, DOW-aware bootstrap from historical actuals
+    ─ S_target : deterministic, forecast-driven (rolling DOW mean proxy)
+    ─ Fill rate: stochastic bootstrap from empirical delivery history
+    ─ Order logic: (s,S) — reorder up to S_target only when inventory < s
+
+    Recommendation logic (quintile-aware):
+    ─ For each intersection, OOS tolerance is derived from CX quintile.
+    ─ Recommended SS = minimum days where fraction of paths with
+      OOS days ≤ oos_tolerance is >= target_sl.
+    """
+
+    MIN_DEMAND_DAYS = 14
+    MIN_FILL_EVENTS = 5
+
+    # Default fill rate pool when intersection history is thin (~85% mean)
+    DEFAULT_FILL_POOL = np.array([
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5, 1.0,
+        1.0, 0.75, 1.0, 1.0, 0.6667, 1.0, 1.0, 0.0, 1.0, 1.0,
+    ], dtype=float)
+
+    def __init__(self, n_sims: int = 2000,
+                 ss_scenarios: Optional[List[int]] = None,
+                 target_sl: float = 0.95):
+        self.n_sims       = n_sims
+        self.ss_scenarios = ss_scenarios or list(range(3, 22))
+        self.target_sl    = target_sl
+
+    def _build_pools(self, data: IntersectionData):
+        """Build demand pools, delivery indices, and fill rate array."""
+        dates = sorted(data.daily_demand.keys())
+        if not dates:
+            raise ValueError("no demand data")
+
+        start  = datetime.date.fromisoformat(dates[0])
+        end    = datetime.date.fromisoformat(dates[-1])
+        n_days = (end - start).days + 1
+        if n_days < self.MIN_DEMAND_DAYS:
+            raise ValueError(f"only {n_days} demand days — need ≥ {self.MIN_DEMAND_DAYS}")
+
+        all_dates = [start + datetime.timedelta(days=i) for i in range(n_days)]
+
+        # Build imputed demand sequence (DOW-median for missing days)
+        dow_vals: Dict[int, List[float]] = {}
+        for ds, val in data.daily_demand.items():
+            d = datetime.date.fromisoformat(ds)
+            dow_vals.setdefault(d.isoweekday(), []).append(val)
+        dow_med    = {dow: float(np.median(v)) for dow, v in dow_vals.items()}
+        global_med = float(np.median(list(data.daily_demand.values()))) \
+                     if data.daily_demand else 10.0
+
+        demand_seq = []
+        for d in all_dates:
+            ds = d.isoformat()
+            if ds in data.daily_demand:
+                demand_seq.append(float(data.daily_demand[ds]))
+            else:
+                demand_seq.append(dow_med.get(d.isoweekday(), global_med))
+
+        # DOW-aware sub-pools
+        wd_vals = [demand_seq[i] for i, d in enumerate(all_dates) if d.isoweekday() <= 4]
+        we_vals = [demand_seq[i] for i, d in enumerate(all_dates) if d.isoweekday() >= 5]
+        wd_pool = np.array(wd_vals if wd_vals else [global_med], dtype=float)
+        we_pool = np.array(we_vals if we_vals else [global_med], dtype=float)
+
+        del_idx    = [i for i, d in enumerate(all_dates) if d.isoweekday() in data.delivery_dows]
+        is_weekday = np.array([d.isoweekday() <= 4 for d in all_dates], dtype=bool)
+
+        fill_arr = (
+            np.array(data.fill_rates, dtype=float).clip(0.0, 1.0)
+            if len(data.fill_rates) >= self.MIN_FILL_EVENTS
+            else self.DEFAULT_FILL_POOL
+        )
+
+        return wd_pool, we_pool, np.array(demand_seq), is_weekday, del_idx, fill_arr, all_dates
+
+    def _rolling_fcst(self, demand_seq: np.ndarray, all_dates: list,
+                      window: int = 28) -> Dict[str, float]:
+        """Rolling DOW-aware average as a forecast proxy for S_target."""
+        fcst = {}
+        for i, d in enumerate(all_dates):
+            ds  = d.isoformat()
+            dow = d.isoweekday()
+            same_dow = [demand_seq[j] for j, od in enumerate(all_dates[:i])
+                        if od.isoweekday() == dow]
+            if same_dow:
+                fcst[ds] = float(np.mean(same_dow[-window:]))
+            elif i > 0:
+                fcst[ds] = float(demand_seq[:i].mean())
+            else:
+                fcst[ds] = float(demand_seq.mean()) if len(demand_seq) else 10.0
+        return fcst
+
+    def run_one(self, data: IntersectionData) -> SimResult:
+        """Run the full SS sweep for one product × location intersection."""
+
+        dow_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        base = SimResult(
+            product_id    = data.product_id,
+            location_id   = data.location_id,
+            product_name  = data.product_name,
+            location_name = data.location_name,
+            case_size     = data.case_size,
+            delivery_dows = ",".join(dow_names[d - 1] for d in sorted(data.delivery_dows)),
+            cx_quintile   = data.cx_quintile,
+            profit_cubic_q = data.profit_cubic_q,
+            sc_quintile   = data.sc_quintile,
+            oos_tolerance = data.oos_tolerance,
+            target_sl_pct = round(self.target_sl * 100, 1),
+            kinaxis_policy    = data.kinaxis_policy,
+            kinaxis_ss_days   = data.kinaxis_ss_days,
+            l13w_revenue  = data.l13w_revenue,
+            oos_pct       = data.oos_pct,
+            demand_mean   = 0.0, demand_std    = 0.0,
+            fill_rate_mean = 0.0, fill_rate_std = 0.0,
+            n_demand_days = 0,   n_deliveries  = 0,
+            recommended_ss_days  = 0,  recommended_sl  = 0.0,
+            current_sl           = 0.0, delta_ss_days  = 0,
+            recommended_avg_stgt = 0.0, recommended_cases = 0,
+            current_avg_stgt     = 0.0, current_cases     = 0,
+            full_sweep = {}, error = data.error,
+        )
+
+        if data.error:
+            return base
+
+        try:
+            wd_pool, we_pool, demand_seq, is_weekday, del_idx, fill_arr, all_dates = \
+                self._build_pools(data)
+        except ValueError as e:
+            base.error = str(e)
+            return base
+
+        n_days   = len(all_dates)
+        pool_mean = demand_seq.mean()
+
+        base.demand_mean    = round(float(pool_mean), 2)
+        base.demand_std     = round(float(demand_seq.std()), 2)
+        base.fill_rate_mean = round(float(fill_arr.mean()), 3)
+        base.fill_rate_std  = round(float(fill_arr.std()), 3)
+        base.n_demand_days  = n_days
+        base.n_deliveries   = len(del_idx)
+
+        fcst_map = self._rolling_fcst(demand_seq, all_dates)
+
+        nxt_map: Dict[int, Tuple[Optional[int], int]] = {}
+        for k, idx in enumerate(del_idx):
+            nxt = del_idx[k + 1] if k + 1 < len(del_idx) else None
+            nxt_map[idx] = (nxt, (nxt - idx) if nxt is not None else 3)
+
+        del_set = set(del_idx)
+        d0 = del_idx[0] if del_idx else 0
+
+        def get_fcst_val(day_offset: int) -> float:
+            ds = all_dates[min(day_offset, n_days - 1)].isoformat()
+            return fcst_map.get(ds, pool_mean)
+
+        def build_stgt(ss_days: int) -> Tuple[np.ndarray, float]:
+            pre = sum(get_fcst_val(j) for j in range(d0))
+            S0  = pre + ss_days * pool_mean
+            arr = np.zeros(n_days)
+            for day in range(n_days):
+                if day in del_set:
+                    _, gap = nxt_map[day]
+                    S0 = (sum(get_fcst_val(day + j) for j in range(1, gap + 1))
+                          + ss_days * pool_mean)
+                arr[day] = S0
+            return arr, pre + ss_days * pool_mean
+
+        def simulate(ss_days: int) -> Tuple[np.ndarray, float]:
+            stgt, S0 = build_stgt(ss_days)
+            cs = max(1, data.case_size)
+
+            wd_i = np.random.randint(0, len(wd_pool), (self.n_sims, n_days))
+            we_i = np.random.randint(0, len(we_pool), (self.n_sims, n_days))
+            dem  = np.where(is_weekday[None, :], wd_pool[wd_i], we_pool[we_i])
+
+            fn = len(fill_arr)
+            fi = np.random.randint(0, fn, (self.n_sims, len(del_idx) + 1))
+
+            seed_qty = math.ceil(
+                sum(get_fcst_val(j) for j in range(d0)) / cs
+            ) * cs
+            pend = np.floor(seed_qty * fill_arr[fi[:, 0]])
+
+            inv      = np.full(self.n_sims, float(S0))
+            days_oos = np.zeros(self.n_sims, dtype=int)
+            dc = 0
+
+            for day in range(n_days):
+                St = stgt[day]
+                if day in del_set:
+                    inv += pend
+                    nxt, _ = nxt_map[day]
+                    dc += 1
+                    if nxt is not None and nxt < n_days:
+                        deficit = np.where(inv < St, St - inv, 0.0)
+                        order_q = np.ceil(deficit / cs) * cs
+                        pend    = np.floor(order_q * fill_arr[fi[:, dc] % fn])
+                    else:
+                        pend = np.zeros(self.n_sims)
+
+                shortfall = np.maximum(dem[:, day] - inv, 0)
+                days_oos += (shortfall > 0).astype(int)
+                inv = np.maximum(inv - dem[:, day], 0)
+
+            return days_oos, float(stgt.mean())
+
+        # ── Sweep ─────────────────────────────────────────────────────────────
+        full_sweep: Dict = {}
+        oos_tol  = data.oos_tolerance   # e.g. 1 for Q1/Q2, 3 for Q3, 4 for Q4/Q5
+        rec_ss   = self.ss_scenarios[-1]
+        rec_sl   = 0.0
+        current_sl = 0.0
+        found_rec  = False
+
+        for ss in self.ss_scenarios:
+            oos_days, avg_st = simulate(ss)
+            sl0    = float((oos_days == 0).mean())
+            sl1    = float((oos_days <= 1).mean())
+            sl_tol = float((oos_days <= oos_tol).mean())   # drives recommendation
+            cases  = math.ceil(avg_st / max(1, data.case_size))
+
+            full_sweep[ss] = {
+                "sl0":     round(sl0, 4),
+                "sl1":     round(sl1, 4),
+                "sl_tol":  round(sl_tol, 4),
+                "avg_stgt": round(avg_st, 1),
+                "cases":   cases,
+            }
+
+            if ss == data.kinaxis_ss_days:
+                current_sl = sl_tol
+
+            # First SS scenario that hits the target service level
+            if not found_rec and sl_tol >= self.target_sl:
+                rec_ss    = ss
+                rec_sl    = sl_tol
+                found_rec = True
+
+        rec_info = full_sweep.get(rec_ss, {})
+        cur_info = full_sweep.get(data.kinaxis_ss_days, {})
+
+        base.recommended_ss_days   = rec_ss
+        base.recommended_sl        = rec_sl
+        base.current_sl            = current_sl
+        base.delta_ss_days         = rec_ss - data.kinaxis_ss_days
+        base.recommended_avg_stgt  = rec_info.get("avg_stgt", 0.0)
+        base.recommended_cases     = rec_info.get("cases", 0)
+        base.current_avg_stgt      = cur_info.get("avg_stgt", 0.0)
+        base.current_cases         = cur_info.get("cases", 0)
+        base.full_sweep            = full_sweep
+
+        return base
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BATCH RUNNER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BatchRunner:
+    def __init__(self, fetcher: DataFetcher, engine: SimulationEngine,
+                 max_workers: int = DEFAULT_MAX_WORKERS):
+        self.fetcher     = fetcher
+        self.engine      = engine
+        self.max_workers = max_workers
+
+    def run(self, candidates: pd.DataFrame) -> List[SimResult]:
+        """
+        candidates must have columns: product_id, location_id.
+        Optional extras: product_name, location_name, cx_quintile_location,
+        profit_cubic_quintile_prod_location, sc_location_quintile,
+        l13w_revenue, oos_pct.
+        """
+        results = []
+        n = len(candidates)
+        print(f"\n{'─'*60}")
+        print(f"Running {n} intersections  |  {self.engine.n_sims:,} sims each  "
+              f"|  target SL {self.engine.target_sl:.0%}")
+        print(f"OOS tolerance by quintile: "
+              f"Q1/Q2→{QUINTILE_OOS_TOLERANCE[1]}d, "
+              f"Q3/NULL→{QUINTILE_OOS_TOLERANCE[3]}d, "
+              f"Q4/Q5→{QUINTILE_OOS_TOLERANCE[4]}d")
+        print(f"{'─'*60}")
+
+        def process_row(row):
+            pid  = int(row.product_id)
+            lid  = int(row.location_id)
+            name = getattr(row, "product_name", str(pid))
+            loc  = getattr(row, "location_name", str(lid))
+            cx_q = getattr(row, "cx_quintile_location", None)
+            pc_q = getattr(row, "profit_cubic_quintile_prod_location", None)
+            sc_q = getattr(row, "sc_location_quintile", None)
+            rev  = float(getattr(row, "l13w_revenue", 0) or 0)
+            oos  = float(getattr(row, "oos_pct", 0) or 0)
+            # Coerce None/NaN quintiles to Python None for tolerance lookup
+            cx_q = None if (cx_q is None or (isinstance(cx_q, float) and math.isnan(cx_q))) \
+                   else int(cx_q)
+            data = self.fetcher.fetch(pid, lid, name, loc, cx_q, pc_q, sc_q, rev, oos)
+            return self.engine.run_one(data)
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+            futures = {pool.submit(process_row, row): i
+                       for i, row in enumerate(candidates.itertuples())}
+            for i, fut in enumerate(as_completed(futures)):
+                r = fut.result()
+                results.append(r)
+                q_label = f"Q{r.cx_quintile}" if r.cx_quintile else "Q?"
+                status  = "✓" if not r.error else f"✗ {r.error[:40]}"
+                print(f"  [{i+1:>{len(str(n))}}/{n}] "
+                      f"[{q_label}|tol≤{r.oos_tolerance}d] "
+                      f"{r.product_name[:32]:32s} @ {r.location_name[:18]:18s}  {status}")
+
+        return results
+
+    def to_dataframe(self, results: List[SimResult]) -> pd.DataFrame:
+        rows = []
+        for r in results:
+            row = dict(
+                product_id          = r.product_id,
+                product_name        = r.product_name,
+                location_id         = r.location_id,
+                location_name       = r.location_name,
+                cx_quintile         = r.cx_quintile,
+                profit_cubic_q      = r.profit_cubic_q,
+                sc_quintile         = r.sc_quintile,
+                oos_tolerance_days  = r.oos_tolerance,
+                target_sl_pct       = r.target_sl_pct,
+                l13w_revenue        = r.l13w_revenue,
+                oos_pct_actual      = r.oos_pct,
+                case_size           = r.case_size,
+                delivery_dows       = r.delivery_dows,
+                kinaxis_policy      = r.kinaxis_policy,
+                kinaxis_ss_days     = r.kinaxis_ss_days,
+                demand_mean         = r.demand_mean,
+                demand_std          = r.demand_std,
+                fill_rate_mean      = r.fill_rate_mean,
+                fill_rate_std       = r.fill_rate_std,
+                n_demand_days       = r.n_demand_days,
+                n_deliveries        = r.n_deliveries,
+                current_ss_days     = r.kinaxis_ss_days,
+                current_sl_tol_pct  = round(r.current_sl * 100, 1),
+                recommended_ss_days = r.recommended_ss_days,
+                recommended_sl_pct  = round(r.recommended_sl * 100, 1),
+                delta_ss_days       = r.delta_ss_days,
+                rec_avg_stgt_units  = r.recommended_avg_stgt,
+                rec_cases           = r.recommended_cases,
+                cur_avg_stgt_units  = r.current_avg_stgt,
+                cur_cases           = r.current_cases,
+                priority            = (
+                    "🔴 HIGH"   if (r.delta_ss_days > 0 and r.oos_pct > 5) else
+                    "🟡 MEDIUM" if r.delta_ss_days > 0 else
+                    "🟢 OK"
+                ),
+                error               = r.error,
+            )
+            # Flatten full sweep: sl_tol at each SS scenario
+            for ss, metrics in r.full_sweep.items():
+                row[f"sl_tol_ss{ss:02d}d"] = round(metrics["sl_tol"] * 100, 1)
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
+        df["_sort"] = df.apply(
+            lambda x: (0 if "HIGH"   in str(x.priority) else
+                       1 if "MEDIUM" in str(x.priority) else 2), axis=1
+        )
+        df = df.sort_values(
+            ["_sort", "cx_quintile", "l13w_revenue"],
+            ascending=[True, True, False]
+        ).drop(columns=["_sort"]).reset_index(drop=True)
+        return df
+
+    @staticmethod
+    def write_outputs(df: pd.DataFrame, out_dir: str = "results"):
+        os.makedirs(out_dir, exist_ok=True)
+        ts        = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path  = os.path.join(out_dir, f"ss_batch_{ts}.csv")
+        xlsx_path = os.path.join(out_dir, f"ss_batch_{ts}.xlsx")
+
+        df.to_csv(csv_path, index=False)
+        print(f"\n  CSV  → {csv_path}")
+
+        with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+            summary_cols = [c for c in df.columns if not c.startswith("sl_tol_ss")]
+            df[summary_cols].to_excel(writer, sheet_name="Summary", index=False)
+            df.to_excel(writer, sheet_name="Full Sweep", index=False)
+
+            ws = writer.sheets["Summary"]
+            for col in ws.columns:
+                max_len = max(len(str(cell.value or "")) for cell in col)
+                ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 40)
+
+        print(f"  XLSX → {xlsx_path}")
+        return csv_path, xlsx_path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Batch safety stock Monte Carlo — quintile-aware OOS tolerance"
+    )
+    p.add_argument("--user",              required=True,
+                   help="Snowflake username (email)")
+    p.add_argument("--password",          default=None,
+                   help="Snowflake password (omit for SSO browser pop-up)")
+    p.add_argument("--candidates",        default=None,
+                   help="CSV with product_id, location_id columns")
+    p.add_argument("--auto-candidates",   action="store_true",
+                   help="Pull all-quintile candidates from Snowflake automatically")
+    p.add_argument("--location-ids",      default="258,37,690,265,99",
+                   help="Comma-separated location IDs for --auto-candidates")
+    p.add_argument("--lookback-days",     type=int,   default=DEFAULT_LOOKBACK_DAYS)
+    p.add_argument("--n-sims",            type=int,   default=DEFAULT_N_SIMS)
+    p.add_argument("--target-sl",         type=float, default=DEFAULT_TARGET_SL,
+                   help="Fraction of paths that must meet OOS tolerance (default 0.95)")
+    p.add_argument("--ss-min",            type=int,   default=DEFAULT_SS_MIN)
+    p.add_argument("--ss-max",            type=int,   default=DEFAULT_SS_MAX)
+    p.add_argument("--max-workers",       type=int,   default=DEFAULT_MAX_WORKERS)
+    p.add_argument("--out-dir",           default="results")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    np.random.seed(42)
+
+    print(f"\n{'═'*60}")
+    print(f"  Batch SS Monte Carlo  (quintile-aware OOS tolerance)")
+    print(f"  User: {args.user}")
+    print(f"  Lookback: {args.lookback_days}d  |  Sims: {args.n_sims:,}  "
+          f"|  Target SL: {args.target_sl:.0%}")
+    print(f"  OOS tolerance: Q1/Q2→1d, Q3/NULL→3d, Q4/Q5→4d")
+    print(f"{'═'*60}")
+
+    # 1. Connect
+    print("\n[1/4] Connecting to Snowflake...")
+    conn = get_connection(args.user, args.password)
+    print("      Connected.")
+
+    fetcher = DataFetcher(conn, lookback_days=args.lookback_days)
+    engine  = SimulationEngine(
+        n_sims       = args.n_sims,
+        ss_scenarios = list(range(args.ss_min, args.ss_max + 1)),
+        target_sl    = args.target_sl,
+    )
+    runner = BatchRunner(fetcher, engine, max_workers=args.max_workers)
+
+    # 2. Load candidates
+    print("\n[2/4] Loading candidates...")
+    if args.auto_candidates:
+        loc_ids = [int(x) for x in args.location_ids.split(",")]
+        print(f"      Pulling all-quintile pairs for locations {loc_ids}...")
+        candidates = fetcher.get_auto_candidates(loc_ids)
+    elif args.candidates:
+        candidates = pd.read_csv(args.candidates)
+    else:
+        print("ERROR: provide --candidates FILE or --auto-candidates", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"      {len(candidates)} intersections loaded.")
+    if "cx_quintile_location" in candidates.columns:
+        dist = candidates["cx_quintile_location"].value_counts(dropna=False).sort_index()
+        print(f"      Quintile distribution:\n{dist.to_string()}")
+
+    # 3. Run
+    print("\n[3/4] Running simulations...")
+    results = runner.run(candidates)
+
+    # 4. Write
+    print("\n[4/4] Writing outputs...")
+    df = runner.to_dataframe(results)
+    runner.write_outputs(df, out_dir=args.out_dir)
+
+    # Summary stats
+    ok   = df[df["error"] == ""]
+    err  = df[df["error"] != ""]
+    high = ok[ok["priority"].str.contains("HIGH", na=False)]
+    print(f"\n{'─'*60}")
+    print(f"  Completed: {len(ok)}/{len(df)}  |  Errors: {len(err)}")
+    if len(ok):
+        print(f"  HIGH priority (OOS>5% + SS gap): {len(high)}")
+        print(f"  Avg delta SS days (all OK): {ok['delta_ss_days'].mean():+.1f}d")
+        for q in [1, 2, 3, 4, 5]:
+            sub = ok[ok["cx_quintile"] == q]
+            if len(sub):
+                print(f"  Q{q} ({len(sub)} products): "
+                      f"avg delta {sub['delta_ss_days'].mean():+.1f}d  "
+                      f"| tol={QUINTILE_OOS_TOLERANCE[q]}d OOS")
+    print(f"{'─'*60}\n")
+
+    conn.close()
+
+
+if __name__ == "__main__":
+    main()
+
+-- parallel loop (16 on mac) / (128 on databricks)
+-- joblib 
